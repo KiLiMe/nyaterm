@@ -1,0 +1,117 @@
+name: Windows Portable
+
+on:
+  push:
+    tags: ['win-portable-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-portable-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  portable:
+    name: Windows portable (x64)
+    runs-on: windows-2025
+    timeout-minutes: 90
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # A portable tag must name the version the workspace actually builds, so the
+      # archive name can never drift from the packaged binaries.
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          $workspace = python -c "import tomllib; print(tomllib.load(open('Cargo.toml', 'rb'))['workspace']['package']['version'])"
+          if ($LASTEXITCODE -ne 0) { throw 'failed to read the Cargo workspace version' }
+          $workspace = $workspace.Trim()
+          $prerelease = $workspace -match '-'
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $tagVersion = $env:GITHUB_REF_NAME -replace '^win-portable-v?', ''
+            if ($tagVersion -ne $workspace) {
+              throw "tag $($env:GITHUB_REF_NAME) names version $tagVersion, but Cargo workspace version is $workspace"
+            }
+          }
+          "version=$workspace" >> $env:GITHUB_OUTPUT
+          "prerelease=$($prerelease.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: ${{ env.TARGET }}
+          cache-key: windows-portable
+          cache-on-failure: 'true'
+          save-cache: always
+
+      # package_native.py always runs makensis; only the portable ZIP is published.
+      - name: Install NSIS
+        shell: pwsh
+        run: ./scripts/ci/install-nsis.ps1
+
+      # Stable versions also emit an MSI, which needs WiX on PATH.
+      - name: Install .NET for WiX
+        if: steps.version.outputs.prerelease == 'false'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install WiX
+        if: steps.version.outputs.prerelease == 'false'
+        shell: pwsh
+        run: ./scripts/ci/install-wix.ps1
+
+      - name: Prepare bundled ConPTY
+        run: python scripts/release/prepare_conpty.py
+
+      - name: Package portable application
+        shell: pwsh
+        env:
+          NYATERM_ARTIFACT_VERSION: ${{ steps.version.outputs.version }}
+          NYATERM_GITHUB_GIST_CLIENT_ID: ${{ vars.NYATERM_GITHUB_GIST_CLIENT_ID }}
+          NYATERM_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Git Bash prepends Git's /usr/bin/link.exe, shadowing MSVC's linker.
+          # Preserve the PATH configured by ilammy/msvc-dev-cmd for Rust builds.
+          $linker = (Get-Command link.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+          if ($linker -notmatch '\\VC\\Tools\\MSVC\\[^\\]+\\bin\\HostX64\\x64\\link\.exe$') {
+            throw "Expected Visual Studio MSVC linker, got: $linker"
+          }
+          Write-Host "Using MSVC linker: $linker"
+          python scripts/release/package_native.py "$env:TARGET"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify portable package
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: >-
+          python scripts/release/verify_native_package.py
+          --target "${TARGET}" --version "${VERSION}"
+          --artifact-version "${VERSION}" --dist dist
+
+      - name: Upload portable archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: nyaterm-windows-x64-portable-${{ steps.version.outputs.version }}
+          path: dist/NyaTerm_${{ steps.version.outputs.version }}_windows_x64_portable.zip
+          if-no-files-found: error
+          retention-days: 30
